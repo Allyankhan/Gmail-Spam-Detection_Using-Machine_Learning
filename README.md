@@ -13,7 +13,9 @@
 
 - [Overview](#overview)
 - [System Architecture](#system-architecture)
+- [Email Processing Flow](#email-processing-flow)
 - [ML Pipeline](#ml-pipeline)
+- [Threat Intelligence Layer](#threat-intelligence-layer)
 - [Tech Stack](#tech-stack)
 - [Installation](#installation)
 - [Configuration](#configuration)
@@ -39,128 +41,116 @@ This project is an end-to-end spam detection and threat intelligence system that
 
 ## System Architecture
 
-The system is split into four major layers that work in sequence: authentication, data ingestion, ML classification, and threat analysis.
+The system is organised into four layers. The Streamlit dashboard sits at the top, driven by `app.py` which coordinates the Gmail API, ML pipeline, and VirusTotal threat intel underneath.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     Streamlit Dashboard                 │
-│         (Live results, risk scores, threat flags)       │
-└────────────────────┬────────────────────────────────────┘
-                     │
-          ┌──────────▼──────────┐
-          │   Orchestration     │  app.py
-          │   (app.py)          │
-          └──┬──────────────┬───┘
-             │              │
-   ┌─────────▼──┐    ┌──────▼──────────┐
-   │ Gmail API  │    │  ML Pipeline    │
-   │ gmail_api  │    │ model_handler   │
-   │            │    │                 │
-   │ OAuth 2.0  │    │ TF-IDF + NB     │
-   └─────────┬──┘    └──────┬──────────┘
-             │              │
-             └──────┬───────┘
-                    │
-          ┌─────────▼────────┐
-          │  Threat Intel    │  vt_api.py
-          │  (VirusTotal)    │
-          │  URL + file scan │
-          └──────────────────┘
+```mermaid
+graph TD
+    A[" Streamlit Dashboard\nLive results · risk scores · threat flags"]
+
+    B[" app.py — Orchestration\nCoordinates all modules end-to-end"]
+
+    C[" Gmail API\ngmail_api.py\n\nOAuth 2.0 auth\nFetch unread emails\nExtract text · URLs · attachments"]
+
+    D["ML Pipeline\nmodel_handler.py\n\nText preprocessing\nTF-IDF vectorization\nNaive Bayes classifier"]
+
+    E[" Threat Intelligence\nvt_api.py\n\nVirusTotal API v3\nURL scanning · attachment hashing\nMulti-engine verdict"]
+
+    A <-->|"predictions & scores"| B
+    B -->|"raw emails"| C
+    B -->|"email text"| D
+    C -->|"URLs & attachments"| E
+    D -->|"spam score"| B
+    E -->|"threat verdict"| B
+
+    style A fill:#7c3aed,color:#ede9fe,stroke:#5b21b6
+    style B fill:#374151,color:#f9fafb,stroke:#1f2937
+    style C fill:#0f766e,color:#ccfbf1,stroke:#0d9488
+    style D fill:#1d4ed8,color:#dbeafe,stroke:#1e40af
+    style E fill:#b91c1c,color:#fee2e2,stroke:#991b1b
 ```
 
 ---
 
 ## Email Processing Flow
 
-```
-User Login (OAuth 2.0)
-        │
-        ▼
-Fetch Unread Emails (Gmail API)
-        │
-        ▼
-Extract Subject + Body Text
-        │
-        ▼
-  ┌─────┴──────┐
-  │            │
-  ▼            ▼
-Text         URLs &
-Preprocess   Attachments
-  │            │
-  ▼            ▼
-TF-IDF      VirusTotal
-Vectorize     API Scan
-  │            │
-  ▼            ▼
-Naive Bayes  Threat Score
-Classifier   (malicious?)
-  │            │
-  └─────┬──────┘
-        │
-        ▼
-  Aggregate Risk Score
-        │
-        ▼
-  Display in Dashboard
-```
+Each email passes through two parallel tracks — text classification and threat scanning — before being aggregated into a final risk score and displayed on the dashboard.
 
-### Step-by-step
+```mermaid
+flowchart TD
+    A([User authenticates\nOAuth 2.0]) --> B[Fetch unread emails\nGmail API]
+    B --> C[Extract subject + body text]
+    C --> D{Parse email content}
 
-1. **OAuth handshake** — The user authenticates once via Google's OAuth 2.0 flow. Credentials are stored locally in `credentials.json` for subsequent runs.
-2. **Email fetch** — `gmail_api.py` queries the Gmail API for unread or recent messages and returns raw email objects.
-3. **Text preprocessing** — Email subject and body are lowercased, stripped of HTML, and tokenized.
-4. **TF-IDF vectorization** — The preprocessed text is transformed using the pre-fitted `vectorizer.pkl`.
-5. **Classification** — `model.pkl` (Multinomial Naive Bayes) outputs a spam probability score between 0 and 1.
-6. **Threat scanning** — Any URLs or file attachments found in the email are submitted to the VirusTotal API via `vt_api.py`.
-7. **Risk aggregation** — ML probability + VirusTotal flags are combined into a final risk level (Low / Medium / High).
-8. **Dashboard render** — Streamlit displays the results in real time with colour-coded risk indicators.
+    D -->|Text content| E[Preprocess text\nlowercase · strip HTML · tokenize]
+    D -->|URLs found| F[Submit URLs\nto VirusTotal]
+    D -->|Attachments found| G[Hash attachments\nSHA-256 → VirusTotal]
+
+    E --> H[TF-IDF vectorize]
+    H --> I[Naive Bayes classifier\nP spam = 0.0 – 1.0]
+
+    F --> J[URL threat verdict\nengines flagged / total]
+    G --> K[File threat verdict\nantivirus scan results]
+
+    I --> L[Aggregate risk score\nML score + VT flags]
+    J --> L
+    K --> L
+
+    L --> M{Risk level}
+    M -->|Low| N[" Clean\nno action"]
+    M -->|Medium| O[" Suspicious\nflagged for review"]
+    M -->|High| P[" Malicious\nblocked + alerted"]
+
+    N --> Q[Render on Streamlit dashboard]
+    O --> Q
+    P --> Q
+```
 
 ---
 
 ## ML Pipeline
 
+The ML pipeline follows a standard scikit-learn pattern: raw text is preprocessed, vectorized with TF-IDF, and scored by a Multinomial Naive Bayes model. Both artefacts are serialised to disk so the app loads them at startup without retraining.
+
+```mermaid
+flowchart LR
+    A([Raw email text\nsubject + body]) --> B
+
+    subgraph B [" Preprocessing "]
+        direction TB
+        B1[Lowercase] --> B2[Strip HTML tags]
+        B2 --> B3[Remove special chars]
+        B3 --> B4[Tokenize + stopword removal]
+    end
+
+    B --> C
+
+    subgraph C [" TF-IDF Vectorizer — vectorizer.pkl "]
+        direction TB
+        C1[Term Frequency per doc] --> C2[Inverse Document Frequency]
+        C2 --> C3[Sparse matrix output\nmax 10,000 features · bigrams]
+    end
+
+    C --> D
+
+    subgraph D [" Multinomial Naive Bayes — model.pkl "]
+        direction TB
+        D1["Compute P(spam | features)"] --> D2[Output probability score\n0.0 – 1.0]
+        D2 --> D3{Threshold = 0.5}
+    end
+
+    D3 -->|score < 0.5| E[" HAM\nlegitimate email"]
+    D3 -->|score ≥ 0.5| F[" SPAM\ntrigger threat scan"]
 ```
-Raw Email Text
-      │
-      ▼
-┌─────────────────────────────────┐
-│         Preprocessing           │
-│  - Lowercase                    │
-│  - Strip HTML tags              │
-│  - Remove special characters    │
-│  - Tokenize                     │
-└──────────────┬──────────────────┘
-               │
-               ▼
-┌─────────────────────────────────┐
-│       TF-IDF Vectorizer         │
-│  - Term Frequency               │
-│  - Inverse Document Frequency   │
-│  - Sparse matrix output         │
-│  (saved as vectorizer.pkl)      │
-└──────────────┬──────────────────┘
-               │
-               ▼
-┌─────────────────────────────────┐
-│   Multinomial Naive Bayes       │
-│  - P(spam | features)           │
-│  - Probability score: 0.0–1.0   │
-│  - Threshold: 0.5 (adjustable)  │
-│  (saved as model.pkl)           │
-└──────────────┬──────────────────┘
-               │
-       ┌───────┴────────┐
-       ▼                ▼
-  Score < 0.5      Score ≥ 0.5
-    HAM ✅           SPAM 🚩
-```
+
+### Model parameters
 
 | Parameter | Value |
 |---|---|
 | Algorithm | Multinomial Naive Bayes |
 | Vectorization | TF-IDF |
 | Feature type | Email subject + body text |
+| Max features | 10,000 |
+| N-gram range | (1, 2) — unigrams + bigrams |
 | Output | Probability score (0.0 – 1.0) |
 | Default threshold | 0.5 |
 
@@ -168,31 +158,29 @@ Raw Email Text
 
 ## Threat Intelligence Layer
 
-Each email is additionally scanned by the VirusTotal API:
+URLs and attachments found in every email — regardless of ML classification — are submitted to the VirusTotal API. Results from 70+ antivirus engines are aggregated into a single risk verdict.
 
+```mermaid
+flowchart TD
+    A[Email parsed by gmail_api.py] --> B{Content type}
+
+    B -->|URLs extracted| C["POST /url/scan\nVirusTotal API v3"]
+    B -->|File attachments| D["SHA-256 hash\nPOST /file/scan\nVirusTotal API v3"]
+
+    C --> E["Engine results\ne.g. 3 / 72 flagged"]
+    D --> F["Antivirus results\nper-engine verdict"]
+
+    E --> G{Positives count}
+    F --> G
+
+    G -->|0 positives| H[" Clean"]
+    G -->|1–3 positives| I[" Suspicious"]
+    G -->|4+ positives| J[" Malicious"]
+
+    H --> K[Return verdict to app.py]
+    I --> K
+    J --> K
 ```
-Email parsed
-     │
-     ├── Extract all URLs ──► Submit to VT /url/scan
-     │                              │
-     │                              ▼
-     │                       positives / total
-     │                       (e.g. 3/72 engines flagged)
-     │
-     └── Extract attachments ──► Submit to VT /file/scan
-                                        │
-                                        ▼
-                                 SHA256 hash lookup
-                                 + antivirus results
-```
-
-Results are summarised as:
-
-| VT Positives | Risk level |
-|---|---|
-| 0 | Clean |
-| 1–3 | Suspicious |
-| 4+ | Malicious |
 
 ---
 
@@ -205,7 +193,7 @@ Results are summarised as:
 | ML library | scikit-learn |
 | Email access | Gmail API (Google Cloud) |
 | Threat intel | VirusTotal Public API v3 |
-| Auth | OAuth 2.0 (google-auth) |
+| Auth | OAuth 2.0 (`google-auth`) |
 | Serialisation | joblib / pickle |
 
 ---
